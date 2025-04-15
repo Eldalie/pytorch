@@ -1,12 +1,21 @@
 # mypy: allow-untyped-defs
 
+from torch.utils._ordered_set import OrderedSet
+
 from ..cutlass_utils import try_import_cutlass
 
 
 if try_import_cutlass():
     import ast
+    import ctypes
     import textwrap
 
+    from cutlass.backend.c_types import (  # type: ignore[import-untyped, import-not-found]
+        EmptyByte,
+    )
+    from cutlass.backend.epilogue import (  # type: ignore[import-untyped, import-not-found]
+        dtype2ctype,
+    )
     from cutlass.backend.evt import (  # type: ignore[import-untyped, import-not-found]
         EpilogueFunctorVisitor,
     )
@@ -25,6 +34,9 @@ if try_import_cutlass():
     from cutlass_library import DataType, EpilogueScheduleType, TileDescription
 
     from torch._inductor.codegen.cuda import cuda_env
+    from torch._inductor.utils import IndentedBuffer
+
+    _CUTLASS_C_DTYPES = OrderedSet(dtype2ctype.values())  # type: ignore[var-annotated]
 
     def trace(
         fn_src: str,
@@ -68,3 +80,82 @@ if try_import_cutlass():
         epilogue_functor = EpilogueFunctor(**kwargs)
         epilogue_functor.trace(example_tensors)
         return epilogue_functor
+
+    def _render_argument_type(epilogue_functor, name_to_buffer):
+        epilogue_thread_type = epilogue_functor.epilogue_thread_type
+
+        # Fragile, but this is the only way to guarantee t is expected type because t is a local class
+        def is_nested_visitor_type(t):
+            return (
+                ".".join([t.__module__, t.__qualname__])
+                == "cutlass.backend.c_types.visitor_factory.<locals>.VisitorType"
+            )
+
+        buffer = IndentedBuffer()
+
+        def render_argument_type(name, t):
+            if issubclass(t, ctypes.c_byte):
+                buffer.writeline(f"{{}}, /* {name} */")
+            else:
+                fields = [
+                    (fname, _get_arg_from_node(ty, name_to_buffer[name]))
+                    for fname, ty in t._fields_
+                ]
+                field_strs = [f"/* {fname} */ {str(field)}" for fname, field in fields]
+                buffer.writeline(f"{{{', '.join(field_strs)}}}, /* {name} */")
+
+        def render_thread_type(name, t):
+            if is_nested_visitor_type(t):
+                buffer.writeline(f"{{ /* {name} */")
+                with buffer.indent():
+                    for name, inner_t in t._fields_:
+                        render_thread_type(name, inner_t)
+                buffer.writeline("},")
+            else:
+                render_argument_type(name, t)
+
+        buffer.writeline("{{")
+        with buffer.indent():
+            render_thread_type("thread", epilogue_thread_type)
+
+        buffer.writeline("}};")
+
+        return buffer.getvalue()
+
+    def _get_arg_from_node(arg_ty, node):
+        from ..cuda_template import CUTLASSTemplate
+
+        # Today, arguments are either a pointer to the
+        # node's memory, a stride tuple, the datatype
+        # Once again, need to check for local class type for stride tuple
+        if (
+            str(arg_ty)
+            == "<class 'cutlass.backend.c_types.tuple_factory_.<locals>.TupleType'>"
+        ):
+            DEFAULT_STRIDE_LEN = 3
+            stride = [int(x) for x in node.get_layout().stride]
+            for _ in range(DEFAULT_STRIDE_LEN - len(stride)):
+                stride.append(0)
+
+            def render_stride(x: int):
+                # Handle EBO for 0 and 1
+                if x == 0:
+                    return "_0{}"
+                elif x == 1:
+                    return "_1{}"
+                else:
+                    return str(x)
+
+            return f"{{{', '.join([render_stride(x) for x in stride])}}}"
+
+        elif issubclass(arg_ty, ctypes.c_void_p):
+            return f"{node.get_name()}.get()"
+        elif (
+            arg_ty in _CUTLASS_C_DTYPES
+        ):  # Assumption: this is the element dtype, this holds for all cutlass ir nodes currently
+            return CUTLASSTemplate._DTYPE_TO_CUTLASS[node.get_layout().dtype]
+        elif issubclass(arg_ty, EmptyByte):
+            return "{}"
+
+        breakpoint()
+        raise NotImplementedError(f"Unsupported arg type: {arg_ty}")
